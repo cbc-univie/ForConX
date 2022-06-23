@@ -1,0 +1,460 @@
+import numpy as np
+#import xml.etree.ElementTree as ET
+from ..md_xml import input_output
+from ..md_xml import molecule
+from ..md_xml import bonds, angles, dihedrals, nonbonded
+
+def build_pair_types():
+    pair_types = []
+    pair_type_map = {}
+    # find the best values for 1-4 parameters for each atom in the molecules
+    atoms = []
+    dihedrals = []
+    natoms = 0
+    for item in root.findall('./molecule'):
+        for name in molecule.atomClass.namelist_atom(item):
+            atoms.append((item.get('name'), name))
+        dihedrals += molecule.namelist_dihedral(item)
+    natoms = len(atoms)
+    ndihedrals = len(dihedrals)
+    A1 = np.zeros((2*ndihedrals,2*natoms), float)
+    b1 = np.zeros((2*ndihedrals,), float)
+    i = 0
+    for item in root.findall('./molecule'):
+        names = molecule.namelist_dihedral(item)
+        for name in names:
+            a1, a4 = name.split()[0], name.split()[3]
+            obj = molecule.dihedralClass(item, name)
+            j1 = atoms.index((item.get('name'), a1))
+            j4 = atoms.index((item.get('name'), a4))
+            A1[i,j1] = 0.5
+            A1[i,j4] = 0.5
+            b1[i] = obj.get_sigma14()
+            A1[i+ndihedrals,j1+natoms] = 0.5
+            A1[i+ndihedrals,j4+natoms] = 0.5
+            b1[i+ndihedrals] = np.log(obj.get_epsilon14()/obj.get_elec14())
+            i += 1
+    x1, res1, rk1, singval1 = np.linalg.lstsq(A1,b1,rcond=1.e-8)
+    res1 = A1.dot(x1) - b1
+
+    if np.abs(res1).max() > 1.e-3:
+        print "Warning: some 1-4 Lennard-Jones parameters cannot be represented by LAMMPS"
+
+    # Try to factorize so that atoms of common types have same 1-4 parameters if possible
+    u,s,v = np.linalg.svd(A1)
+    mask = np.ones((2*natoms,), bool)
+    mask2 = np.abs(s) > 1.e-8
+    mask[:mask2.size] -= mask2
+    null = v[mask].transpose()
+    # x1 + null * x2 are also optimal parameters whatever x2
+    # which is the best among the optimal options?
+    if null.size > 0:
+        atypes = []
+        for item in root.findall('./nonbonded/atom'):
+            atypes.append(item.get('type'))
+        ntypes = len(atypes)
+        A2 = np.eye(2*(natoms+ntypes), dtype=float)
+        b2 = np.zeros((2*(natoms+ntypes),), float)
+        for item in root.findall('./nonbonded/atom'):
+            tp = item.get('type')
+            i = atypes.index(tp) + 2 * natoms
+            obj = nonbonded.atomClass(root, tp)
+            b2[i] = obj.get_sigma()
+            b2[i+ntypes] = np.log(obj.get_epsilon())
+        j = 0
+        for imol,item in enumerate(root.findall('./molecule')):
+            names = molecule.namelist_atom(item)
+            for name in names:
+                obj = molecule.atomClass(item, name)
+                tp = obj.get_type()
+                obj2 = nonbonded.atomClass(root,tp)
+                i = atypes.index(tp)
+                A2[j,2*natoms+i] = -1.
+                A2[j+natoms,2*natoms+ntypes+i] = -1.
+                j += 1
+        nnull = null.shape[1]
+        A3 = np.zeros((2*(natoms+ntypes),nnull+2*ntypes), float)
+        b3 = b2.copy()
+        A3[:2*natoms,:nnull] = A2[:2*natoms,:2*natoms].dot(null)
+        A3[:,nnull:] = A2[:,2*natoms:]
+        b3[:2*natoms] -= A2[:2*natoms,:2*natoms].dot(x1)
+        x3, res3, rk3, singval3 = np.linalg.lstsq(A3, b3, rcond=1.e-8)
+        xopt = x1 + null.dot(x3[:nnull])
+        res1 = A1.dot(xopt) - b1
+    else:
+        xopt = x1
+    for imol,item in enumerate(root.findall('./molecule')):
+        names = molecule.namelist_atom(item)
+        for name in names:
+            key = (item.get('name'), name)
+            i = atoms.index(key)
+            obj = molecule.atomClass(item, name)
+            tp = obj.get_type()
+            obj2 = nonbonded.atomClass(root, tp)
+            val = (tp, obj2.get_epsilon(), obj2.get_sigma(), np.exp(xopt[i+natoms]), xopt[i])
+            found = False
+            for ifatp, fatp in enumerate(pair_types):
+                if val[0] == fatp[0] and np.allclose(val[1:], fatp[1:]):
+                    found = True
+                    break
+            if found:
+                pair_type_map[key] = ifatp
+            else:
+                pair_type_map[key] = len(pair_types)
+                pair_types.append(val)
+    return pair_types, pair_type_map
+
+#root = input.read("forconx.xml")
+root = input.read()
+out_formats = {}
+
+pair_types, pair_type_map = build_pair_types()
+pair_style = set()
+style = "lj/charmm/coul/long"
+pair_style.add(style)
+out_formats['pair',style] = "%16.8f %16.8f %16.8f %16.8f"
+pair_style = list(pair_style)
+
+atom_types = set()
+for item in root.findall('./molecule'):
+    mname = item.get('name')
+    names = molecule.namelist_atom(item)
+    for name in names:
+        obj = molecule.atomClass(item, name)
+        tp = obj.get_type()
+        m = obj.get_mass()
+        q = obj.get_charge()
+        ptp = pair_type_map[mname, name]
+        atom_types.add((tp, m, q, ptp))
+atom_types = list(atom_types)
+atom_style = ['charge', 'template mymols']
+natom_types = len(atom_types)
+
+bond_types = set()
+bond_style = set()
+for item in root.findall('./bonds/*'):
+    tag = item.tag.lower()
+    tp = item.get('type')
+    style = tag.upper()
+    if tag == 'harm':
+        style = 'harmonic'
+        obj = bonds.harmClass(root, tp)
+        k = float(obj.get_k())
+        r0 = obj.get_r0()
+        bond_types.add((style, tp, k, r0))
+        if ('bond', style) not in out_formats:
+            out_formats['bond',style] = "%16.8f %16.8f"
+    bond_style.add(style)
+bond_types = list(bond_types)
+bond_style = list(bond_style)
+nbond_types = len(bond_types)
+
+angle_types = set()
+angle_style = set()
+for item in root.findall('./angles/*'):
+    tag = item.tag.lower()
+    tp = item.get('type')
+    style = tag.upper()
+    if tag == 'harm':
+        style = 'harmonic'
+        obj = angles.harmClass(root, tp)
+        k = float(obj.get_k())
+        theta0 = obj.get_theta0()
+        angle_types.add((style, tp, k, theta0))
+        if ('angle', style) not in out_formats:
+            out_formats['angle',style] = "%16.8f %16.8f"
+    angle_style.add(style)
+angle_types = list(angle_types)
+angle_style = list(angle_style)
+nangle_types = len(angle_types)
+
+dihedral_types = set()
+dihedral_style = set()
+for item in root.findall('./molecule'):
+    names = molecule.namelist_dihedral(item)
+    for name in names:
+        obj = molecule.dihedralClass(item, name)
+        tp = obj.get_type()
+        elec14 = obj.get_elec14()
+        item2 = root.find('./dihedrals/*[@type="'+tp+'"]')
+        tag = item2.tag.lower()
+        style = tag.upper()
+        if tag == 'cos':
+            style = 'charmm'
+            obj2 = dihedrals.cosClass(root, tp)
+            ks = obj2.get_k()
+            ns = obj2.get_n()
+            deltas = obj2.get_delta()
+            for i in xrange(len(ns)):
+                k = ks[i]
+                n = ns[i]
+                delta = deltas[i]
+                if i == 0: factor14 = elec14
+                else: factor14 = 0.
+                dihedral_types.add((style, tp, k, int(n), int(delta), factor14))
+            if ('dihedral', style) not in out_formats:
+                out_formats['dihedral',style] = "%16.8f %6d %6d %16.8f"
+        dihedral_style.add(style)
+dihedral_types = list(dihedral_types)
+dihedral_style = list(dihedral_style)
+ndihedral_types = len(dihedral_types)
+
+with open("data.lmp", "w") as f:
+    print >>f, "# LAMMPS data file generated by ForConX"
+    print >>f
+    if natom_types > 0: print >>f, "%6d atom types" % natom_types
+    if nbond_types > 0: print >>f, "%6d bond types" % nbond_types
+    if nangle_types > 0: print >>f, "%6d angle types" % nangle_types
+    if ndihedral_types > 0: print >>f, "%6d dihedral types" % ndihedral_types
+    if natom_types > 0:
+        print >>f
+        print >>f, "Masses"
+        print >>f
+        for itp, tp in enumerate(atom_types):
+            print >>f, "%6d %10.6f # %s" % (itp+1, tp[1], tp[0])
+        if len(pair_style) == 1:
+            print >>f
+            print >>f, "Pair Coeffs #",
+            for style in pair_style: print >>f, style,
+            print >>f
+            print >>f
+            for itp, tp in enumerate(atom_types):
+                print >>f, "%6d" % (itp+1), out_formats['pair',pair_style[0]] % pair_types[tp[3]][1:], "# %s" % tp[0]
+
+    if nbond_types > 0:
+        print >>f
+        print >>f, "Bond Types #",
+        if len(bond_style) > 1: print >>f, "hybrid",
+        for style in bond_style: print >>f, style,
+        print >>f
+        print >>f
+        for itp, tp in enumerate(bond_types):
+            print >>f, "%6d" % (itp+1),
+            if len(bond_style) > 1: print >>f, tp[0],
+            print >>f, out_formats['bond',tp[0]] % tp[2:], "# %s" % tp[1]
+    if nangle_types > 0:
+        print >>f
+        print >>f, "Angle Types #",
+        if len(angle_style) > 1: print >>f, "hybrid",
+        for style in angle_style: print >>f, style,
+        print >>f
+        print >>f
+        for itp, tp in enumerate(angle_types):
+            print >>f, "%6d" % (itp+1),
+            if len(angle_style) > 1: print >>f, tp[0],
+            print >>f, out_formats['angle',tp[0]] % tp[2:], "# %s" % tp[1]
+    if ndihedral_types > 0:
+        print >>f
+        print >>f, "Dihedral Types #",
+        if len(dihedral_style) > 1: print >>f, "hybrid",
+        for style in dihedral_style: print >>f, style,
+        print >>f
+        print >>f
+        for itp, tp in enumerate(dihedral_types):
+            print >>f, "%6d" % (itp+1),
+            if len(dihedral_style) > 1: print >>f, tp[0],
+            print >>f, out_formats['dihedral',tp[0]] % tp[2:], "# %s" % tp[1]
+
+for item in root.findall('./molecule'):
+    mname = item.get('name')
+    atomnames = molecule.namelist_atom(item)
+    bondnames = molecule.namelist_bond(item)
+    anglenames = molecule.namelist_angle(item)
+    dihedralnames = molecule.namelist_dihedral(item)
+    with open(mname.lower()+'.mol', "w") as f:
+        print >>f, "# LAMMPS molecule template file for %s generated by ForConX" % mname
+        print >>f
+        print >>f, "%8d atoms" % len(atomnames)
+        print >>f, "%8d bonds" % len(bondnames)
+        print >>f, "%8d angles" % len(anglenames)
+        print >>f, "%8d dihedrals" % len(dihedralnames)
+        print >>f
+        print >>f, "Types"
+        print >>f
+        for i, name in enumerate(atomnames):
+            obj = molecule.atomClass(item, name)
+            tp = obj.get_type()
+            m = obj.get_mass()
+            q = obj.get_charge()
+            ptp = pair_type_map[mname, name]
+            itp = atom_types.index((tp, m, q, ptp))
+            #print >>f, "%8d %6d # %s" % (i+1, itp+1, tp)
+            print >>f, "%8d %6d" % (i+1, itp+1)
+        print >>f
+        print >>f, "Masses"
+        print >>f
+        for i, name in enumerate(atomnames):
+            obj = molecule.atomClass(item, name)
+            tp = obj.get_type()
+            m = obj.get_mass()
+            #print >>f, "%8d %10.6f # %s" % (i+1, m, tp)
+            print >>f, "%8d %10.6f" % (i+1, m)
+        print >>f
+        print >>f, "Charges"
+        print >>f
+        for i, name in enumerate(atomnames):
+            obj = molecule.atomClass(item, name)
+            tp = obj.get_type()
+            q = obj.get_charge()
+            #print >>f, "%8d %10.6f # %s" % (i+1, q, tp)
+            print >>f, "%8d %10.6f" % (i+1, q)
+        print >>f
+        print >>f, "Bonds"
+        print >>f
+        for i, name in enumerate(bondnames):
+            obj = molecule.bondClass(item, name)
+            tp = obj.get_type()
+            for itp, bondtype in enumerate(bond_types):
+                if bondtype[1] == tp: break
+            i1, i2 = map(atomnames.index, name.split())
+            #print >>f, "%8d %6d %8d %8d # %s" % (i+1, itp+1, i1+1, i2+1, tp)
+            print >>f, "%8d %6d %8d %8d" % (i+1, itp+1, i1+1, i2+1)
+        print >>f
+        print >>f, "Angles"
+        print >>f
+        for i, name in enumerate(anglenames):
+            obj = molecule.angleClass(item, name)
+            tp = obj.get_type()
+            for itp, angletype in enumerate(angle_types):
+                if angletype[1] == tp: break
+            i1, i2, i3 = map(atomnames.index, name.split())
+            #print >>f, "%8d %6d %8d %8d %8d # %s" % (i+1, itp+1, i1+1, i2+1, i3+1, tp)
+            print >>f, "%8d %6d %8d %8d %8d" % (i+1, itp+1, i1+1, i2+1, i3+1)
+        print >>f
+        print >>f, "Dihedrals"
+        print >>f
+        for i, name in enumerate(dihedralnames):
+            obj = molecule.dihedralClass(item, name)
+            tp = obj.get_type()
+            for itp, dihedraltype in enumerate(dihedral_types):
+                if dihedraltype[1] == tp: break
+            i1, i2, i3, i4 = map(atomnames.index, name.split())
+            #print >>f, "%8d %6d %8d %8d %8d %8d # %s" % (i+1, itp+1, i1+1, i2+1, i3+1, i4+1, tp)
+            print >>f, "%8d %6d %8d %8d %8d %8d" % (i+1, itp+1, i1+1, i2+1, i3+1, i4+1)
+        print >>f
+        print >>f, "Special Bond Counts"
+        print >>f
+        neigh = {}
+        for i, name in enumerate(atomnames):
+            neigh[name] = [set([name]),set(),set(),set()]
+            for base in neigh[name][0]:
+                for partners in bondnames:
+                    partner_list = partners.split()
+                    if base not in partner_list: continue
+                    partner_list.remove(base)
+                    neigh[name][1].add(partner_list[0])
+            neigh[name][1] = neigh[name][1].difference(neigh[name][0])
+            for base in neigh[name][1]:
+                for partners in bondnames:
+                    partner_list = partners.split()
+                    if base not in partner_list: continue
+                    partner_list.remove(base)
+                    neigh[name][2].add(partner_list[0])
+            neigh[name][2] = neigh[name][2].difference(neigh[name][0])
+            neigh[name][2] = neigh[name][2].difference(neigh[name][1])
+            for base in neigh[name][2]:
+                for partners in bondnames:
+                    partner_list = partners.split()
+                    if base not in partner_list: continue
+                    partner_list.remove(base)
+                    neigh[name][3].add(partner_list[0])
+            neigh[name][3] = neigh[name][3].difference(neigh[name][0])
+            neigh[name][3] = neigh[name][3].difference(neigh[name][1])
+            neigh[name][3] = neigh[name][3].difference(neigh[name][2])
+            #print >>f, "%8d %6d %6d %6d # %s" % (i+1, len(neigh[name][1]), len(neigh[name][2]), len(neigh[name][3]), name)
+            print >>f, "%8d %6d %6d %6d" % (i+1, len(neigh[name][1]), len(neigh[name][2]), len(neigh[name][3]))
+        print >>f
+        print >>f, "Special Bonds"
+        print >>f
+        for i, name in enumerate(atomnames):
+            print >>f, "%8d" % (i+1),
+            for partner in neigh[name][1]:
+                ipartner = atomnames.index(partner)
+                print >>f, "%8d" % (ipartner+1),
+            for partner in neigh[name][2]:
+                ipartner = atomnames.index(partner)
+                print >>f, "%8d" % (ipartner+1),
+            for partner in neigh[name][3]:
+                ipartner = atomnames.index(partner)
+                print >>f, "%8d" % (ipartner+1),
+            print >>f
+
+with open("in.lmp", "w") as f:
+    print >>f, "# LAMMPS command file generated by ForConX"
+    print >>f
+    print >>f, "units real"
+    print >>f
+    print >>f, "molecule mymols",
+    for item in root.findall('./molecule'):
+        print >>f, "%s.mol" % item.get('name').lower(),
+    print >>f
+    print >>f
+    print >>f, "atom_style     ",
+    if len(atom_style) > 1: print >>f, "hybrid",
+    for style in atom_style: print >>f, style,
+    print >>f
+    if len(bond_types) > 0:
+        print >>f, "bond_style     ", 
+        if len(bond_style) > 1: print >>f, "hybrid",
+        for style in bond_style: print >>f, style,
+        print >>f
+    if len(angle_types) > 0:
+        print >>f, "angle_style    ", 
+        if len(angle_style) > 1: print >>f, "hybrid",
+        for style in angle_style: print >>f, style,
+        print >>f
+    if len(dihedral_types) > 0:
+        print >>f, "dihedral_style ", 
+        if len(dihedral_style) > 1: print >>f, "hybrid",
+        for style in dihedral_style: print >>f, style,
+        print >>f
+    if len(pair_types) > 0:
+        print >>f, "pair_style     ", 
+        if len(pair_style) > 1: print >>f, "hybrid/overlay",
+        for style in pair_style: print >>f, style,
+        print >>f
+    print >>f, "kspace_style   ", "pppm 1.e-4"
+    print >>f
+    print >>f, "special_bonds lj/coul 0. 0. 0."
+    print >>f, "read_data data.lmp"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

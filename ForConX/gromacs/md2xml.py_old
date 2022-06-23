@@ -1,0 +1,808 @@
+#!/usr/bin/python
+import xml.etree.ElementTree as ET
+import re,sys
+import os.path
+from operator import itemgetter, attrgetter
+
+#==================================================================================================
+# md2xml.preprocess
+#==================================================================================================
+def preprocess(file):
+    """
+    preprocess handles include statements in the topology file.
+    All input files will be merged and comment and blank lines deleted.
+    """
+    lines = []
+    f = open(file)
+    for line in f:
+        line = (line.split(";"))[0].strip()
+        if len(line)<2:
+            continue
+        if line[0:8]=="#include":
+            line = line.split()
+            filename = re.sub('\"', '', line[1])
+            print ">    Open %s ..."%filename
+            lines += (preprocess(filename))
+        else:
+            lines.append(line) 
+    f.close()
+    return lines
+    
+#==================================================================================================
+# md2xml.read_top
+#==================================================================================================
+def read_top(root,f):
+    """
+    The routine reads the file which is produced by the routine preprocess.
+
+    -> decompose_residue
+    -> read_atom
+    -> read_bond
+    -> read_angle
+    -> read_dihedral_improper
+    -> find_atom_parameter
+    -> find_parameter_bonds
+    -> find_parameter_angles
+    -> find_parameter_dihedrals
+    """
+    from ..md_xml import helpers
+    
+    residue = {}
+    charge = {}
+    mass = {}
+    polar = {}
+    read_atoms = False
+    read_connectivity = False
+    autogen_angle = True
+    autogen_dihedral = True
+    id_index=0
+
+    print"\n\t-------------------------------"
+    print"\t 1.1 Reading molecules"
+    print"\t-------------------------------"
+    print">\t Reading keywords"
+    molname = False
+    read_atoms = False
+    read_bonds = False
+    read_angles = False
+    read_dihedrals = False
+    read_moleculetype = False
+    read_options = False
+
+    for line in f:
+        if "defaults" in line:
+            print "\t\t[defaults] ..."
+            read_options = True
+        elif "moleculetype" in line:
+            print "\t\t[moleculetype] ..."
+            read_moleculetype = True
+            read_options = False
+        elif read_moleculetype:
+            mol_name = line.split()
+            molecule = mol_name[0]
+            molecule = re.sub(' ', '', molecule)
+            mol_name = ""
+            mol_name += molecule
+            if molecule not in residue:
+                residue[molecule] = []
+                residue[molecule].append(mol_name)
+            read_moleculetype = False
+        elif "atoms" in line:
+            print "\t\t[atoms] ..."
+            read_atoms = True
+            read_bonds = False
+            read_dihedrals = False
+            read_options = False
+        elif "bonds" in line:
+            print "\t\t[bonds] ..."
+            read_atoms = False
+            read_bonds = True
+            read_dihedrals = False
+            read_options = False
+        elif "pairs" in line:
+            print "\t\t[pairs] ..."
+            read_bonds = False
+            read_dihedrals = False
+        elif "angles" in line:
+            print "\t\t[angles] ..."
+            read_bonds = False
+            read_angles = True
+        elif "dihedrals" in line:
+            print "\t\t[dihedrals] ..."
+            read_bonds = False
+            read_angles = False
+            read_dihedrals = True
+        elif "atomtypes" in line:
+            read_dihedrals = False
+            read_options = False
+        elif "system" in line:
+            read_dihedrals = False
+            read_options = False
+        elif read_options:
+	    line_element = line.split()
+            if line_element == "2":
+                helpers.error('The Buckingham potential is currently not supported by ForConX.')
+            fudge_lj = float(line_element[3])
+            fudge_qq = float(line_element[4])
+            # Is the global definition of 1-4 interactions implemented?
+       # elif read_atoms and line_element[0] is int:
+        elif read_atoms: 
+            line_sub = re.sub('\n', '', line)
+            ext_atom = "ATOM "
+            ext_atom += line_sub
+            residue[molecule].append(ext_atom)
+        elif read_bonds: 
+            ext_bond = "BOND "
+            line_sub = re.sub('\n', '', line)
+            ext_bond += line_sub
+            residue[molecule].append(ext_bond)
+        elif read_angles:
+            ext_angl = "ANGL "
+            line_sub = re.sub('\n', '', line)
+            ext_angl += line_sub
+            residue[molecule].append(ext_angl)
+        elif read_dihedrals:
+            ext_dihe = "DIHE "
+            line_sub = re.sub('\n', '', line)
+            ext_dihe += line_sub
+            residue[molecule].append(ext_dihe)
+
+    print"\n\t---------------------------------------------------"
+    print"\t1.2 Converting residues to XML"
+    print"\t---------------------------------------------------"
+    id_index = 0
+    for mol in root.findall('molecule'):
+        molname = mol.get('name')
+        if molname is None:
+            continue
+
+        (atom,bond,angle,dihedral,improper) = decompose_residue(molname,residue)
+
+        if len(angle)==0:
+            angle = ["AUTOGENERATE"]
+        if len(dihedral)==0:
+            dihedral = ["NO-DIHEDRAL"]
+# old_id consider the ongoing index for the atoms
+        old_id = id_index
+
+#       types and id are only valid for the current molecule
+#       Read atoms
+        (id_index,type_atom,id_atom,natom) = read_atom(root,mol,molname,atom,id_index)
+        print "\t\tNumber of atoms     = %5s" % natom
+#       Bonds
+        nbond = read_bond(root,mol,bond,id_atom,old_id)
+        print"\t\tNumber of bonds     = %5s" % (nbond)
+
+#       Generate "connect matrix" which is necessary for automatic
+#       angle and dihedral generation
+        bonds = mol.findall('bond')
+
+#       Angles
+        nangle = read_angle(root,mol,angle,id_atom,old_id)
+        print"\t\tNumber of angles    = %5s" % (nangle)
+        if "AUTOGENERATE" in angle:
+            print "\t\t\t(autogenerated)",
+
+#       Dihedrals and impropers are handled equally in GROMACS
+	if "NO-DIHEDRAL" in dihedral:
+            ndihedral = 0
+	    nimproper = 0
+            print"\t\tNumber of dihedrals = %5s" % (ndihedral)
+            print"\t\tNumber of impropers = %5s" % (nimproper)
+        else:
+            ndihedral, nimproper = read_dihedral_improper(root,mol,dihedral,id_atom,old_id)
+            print"\t\tNumber of dihedrals = %5s" % (ndihedral)
+            if "AUTOGENERATE" in dihedral:
+                print "\t\t\t(autogenerated)",
+            print"\t\tNumber of impropers = %5s" % (nimproper)
+
+    read_atomtypes = False
+    read_bondtypes = False
+    read_angletypes = False
+    read_dihedraltypes = False
+
+    # Check for special 1-4 interaction is missing
+    parameterlist = {}
+    parameterlist["ATOMS"] = []
+    parameterlist["BONDS"] = []
+    parameterlist["ANGLES"] = []
+    parameterlist["DIHEDRALS"] = []
+    parameterlist["IMPROPERS"] = []
+    parameterlist["NONBONDED"] = []
+    
+    for line in f:
+        if "atomtypes" in line:
+            read_atomtypes = True
+            read_bondtypes = False
+            read_angletypes = False
+            read_dihedraltypes = False
+        elif "bondtypes" in line:
+            read_atomtypes = False
+            read_bondtypes = True
+            read_angletypes = False
+            read_dihedraltypes = False
+        elif "angletypes" in line:
+            read_atomtypes = False
+            read_bondtypes = False
+            read_angletypes = True
+            read_dihedraltypes = False
+        elif "dihedraltypes" in line:
+            read_atomtypes = False
+            read_bondtypes = False
+            read_angletypes = False
+            read_dihedraltypes = True
+        elif "moleculetype" in line:
+            read_atomtypes = False
+            read_bondtypes = False
+            read_angletypes = False
+            read_dihedraltypes = False
+        elif read_atomtypes:
+            line2 = re.sub("[\n]",' ',line)
+            parameterlist["ATOMS"].append(line2)           
+        elif read_bondtypes:
+            line2 = re.sub("[\n]",' ',line)
+            parameterlist["BONDS"].append(line2)
+        elif read_angletypes:
+            line2 = re.sub("[\n]",' ',line)
+            parameterlist["ANGLES"].append(line2)
+        elif read_dihedraltypes:
+            line2 = re.sub("[\n]",' ',line)
+            parameterlist["DIHEDRALS"].append(line2)
+            
+    print"\t--------------------------------------------------------------------------------------------------"
+    print"\t1.3. Assigning atom parameter, force constants and equilibrium values of intramolecular potentials"
+    print"\t--------------------------------------------------------------------------------------------------"
+    iatoms      = find_atom_parameter(root,parameterlist["ATOMS"],fudge_lj,fudge_qq)
+    print "\t\tNumber of nonbonded parameter   = %6s" % (iatoms)
+    # Set global 1-4 scaling
+    for nb in root.findall('nonbonded'):
+        nb.elec14 = fudge_qq
+        nb.vdw14 = fudge_lj
+    ibonds      = find_parameter_bonds(root,parameterlist["BONDS"])
+    print "\t\tNumber of bond potentials       = %6s" % (ibonds)
+    iangles     = find_parameter_angles(root,parameterlist["ANGLES"])
+    print "\t\tNumber of angles potentials     = %6s" % (iangles)
+    idihedrals  = find_parameter_dihedrals(root,parameterlist["DIHEDRALS"])
+    print "\t\tNumber of dihedral potentials   = %6s" % (idihedrals)
+    print
+    # Impropers are not defined separately
+
+    return
+        
+#==================================================================================================
+# md2xml.decompose_residue
+#==================================================================================================
+def decompose_residue(molname,residue):
+    """
+    Generate hashes to atom, bond, angle, dihedral and improper information
+    """
+    atom     = []
+    bond     = []
+    angle    = []
+    dihedral = []
+    improper = []
+
+    #   Decompose residue information into atom, bond, angle, dihedral and improper 
+    print'\t<molecule name="%s">'%molname
+    for line in residue[molname]:
+        if line[0:4]=="ATOM":
+            atom.append(line)
+            
+        if line[0:4]=="BOND":
+            bond.append(line)
+
+        if line[0:4]=="DOUB":
+            bond.append(line)
+
+        if line[0:4]=="TRIP":
+            bond.append(line)
+
+        if line[0:4]=="AROM":
+            bond.append(line)
+
+        if line[0:4]=="ANGL":
+            angle.append(line)
+
+        if line[0:4]=="THET":
+            angle.append(line)
+
+        if line[0:4]=="DIHE":
+            dihedral.append(line)
+
+        if line[0:4]=="IMPH":
+            improper.append(line)
+
+        if line[0:4]=="IMPR":
+            improper.append(line)
+    return atom,bond,angle,dihedral,improper
+
+#==================================================================================================
+# md2xml.read_atom
+#==================================================================================================
+def read_atom(root,mol,molname,atom,id_index):
+    """
+    reading atoms from molecules
+    Virtual atoms are detected by the mass
+    IMPORTANT: Check when Drude particles can be handled by ForConX. 
+    Maybe the detection has to be adjusted.
+    """
+    from ..md_xml import molecule
+
+    type_atom = {}
+    id_atom   = {}
+    name_list = {}
+    natom = 0
+
+    current_molecule = molecule.moleculeElement(mol,molname)
+    for line in atom:
+        natom += 1
+        id_index += 1
+        line_element    = line.split()
+        atomtype        = line_element[2]
+        charge          = float(line_element[7])
+        mass            = float(line_element[8])
+
+        # Auxiliary variables to assign the bonds
+        atomname            = current_molecule.unique_atomname(line_element[5])
+        type_atom[atomname] = line_element[2]
+        id_atom[atomname]   = str(id_index)
+
+        if mass>0.1:
+            current_atom = molecule.atomClass(mol,atomname)
+            current_atom.mass = mass
+#       Virtual particle        
+        else:
+            current_atom = molecule.virtualClass(mol,atomname)
+        current_atom.type = atomtype
+        current_atom.charge = charge
+
+        # We currently check out the Drude implementation in Gromacs. I will implement this if first simulations are stable
+        # Benjamin Code
+
+        
+    return id_index,type_atom,id_atom,natom
+
+#==================================================================================================
+# md2xml.read_bond
+#==================================================================================================
+def read_bond(root,mol,bond,id_atom,old_id):
+    """
+    Convert the indices given in the Gromacs input into atomtypes/names
+    Gromacs has two possibilities to assign force constant and equilibrium distance to bonds. One
+    uses a separate parameter file and the other implementation directly assign the force constant
+    and equilibrium distance to each bond - this definition uses the molecule itp file. In order to
+    consider this, the if-conditions for the length of the line are used.
+    Currently supported potentials are:
+    - harmonic
+    - Morse potential
+    """
+    from ..md_xml import molecule
+    from ..md_xml import bonds
+    from ..md_xml import helpers
+    
+    ibond = 0
+    for line in bond:
+        line = line.split()
+        del line[0]
+        bond0 = -1
+        for i in id_atom:
+            if str(int(line[0])+old_id) == id_atom[i]:
+                bond0 = i
+        for i in id_atom:
+            if str(int(line[1])+old_id) == id_atom[i]:
+                bond1 = i
+        if bond0 < 0:
+            helpers.error('Please check your input files- Error while reading bonds!')
+        atomnames = ''.join([bond0," ",bond1])
+        atom_i = molecule.atomClass(mol,bond0)
+        atom_j = molecule.atomClass(mol,bond1)
+        type_i = atom_i.type
+        type_j = atom_j.type
+        if type_i is None:
+            atom_i.remove()
+            continue
+        if type_j is None:
+            atom_j.remove()
+            continue
+        atomtypes = ' '.join([type_i,' ',type_j])
+        molecule.bondClass(mol,atomnames)
+        if line[2] == "1":
+            bond = bonds.harmClass(root,atomtypes)
+            if(len(line)>3):
+                bond = bonds.harmClass(root,atomtypes)
+                bond.k = float(line[4]) * 0.5 
+                bond.r0 = float(line[3]) 
+        elif line[2] == "3":
+            bond = bonds.morsClass(root,atomtypes)
+            if(len(line)>3):
+                bond = bonds.morsClass(root,atomtypes)
+                bond.r0 = float(line[3]) 
+                bond.D0 = float(line[4])
+                bond.alpha = float(line[5])
+        else:
+            print "This bondtype is not supported by ForConX."
+            sys.exit(2)
+        ibond += 1
+    return ibond
+
+#==================================================================================================
+# md2xml.read_angle
+#==================================================================================================
+def read_angle(root,mol,angle,id_atom,old_id):
+    """
+    This routine acts completely similar as read_bonds
+    Currently supported potential is only harmonic.
+
+    """
+    from ..md_xml import molecule
+    from ..md_xml import angles
+    iangle = 0    
+#   AUTOGENERATION
+    if "AUTOGENERATE" in angle[0]:
+        for atomnames in molecule.namelist_angle(mol):
+            iangle  += 1
+            molecule.angleClass(mol,atomnames)
+            atoms = atomnames.split()
+            atom_i = molecule.atomClass(mol,atoms[0])
+            atom_j = molecule.atomClass(mol,atoms[1])
+            atom_k = molecule.atomClass(mol,atoms[2])
+            atomtypes  = ' '.join([atom_i.type,
+                                   atom_j.type,
+                                   atom_k.type])
+            angles.harmClass(root,atomtypes)
+        return iangle
+
+#   Using given ANGLE information from topology file  
+    for line in angle:
+        line = line.split()
+        del line[0]
+        iangle += 1
+        angle0 = -1
+        for i in id_atom:
+            if str(int(line[0])+old_id) == id_atom[i]:
+                angle0 = i
+        for i in id_atom:
+            if str(int(line[1])+old_id) == id_atom[i]:
+                angle1 = i
+        for i in id_atom:
+            if str(int(line[2])+old_id) == id_atom[i]:
+                angle2 = i
+        if angle0 < 0:
+            print "Please check your input files- Error while reading angles!"
+            sys.exit(2)
+        atomnames = ' '.join([angle0, angle1, angle2])
+        atom_i = molecule.atomClass(mol,angle0)
+        atom_j = molecule.atomClass(mol,angle1)
+        atom_k = molecule.atomClass(mol,angle2)
+        type_i = atom_i.type
+        type_j = atom_j.type
+        type_k = atom_k.type
+        if type_i is None:
+            atom_i.remove()
+            continue
+        if type_j is None:
+            atom_j.remove()
+            continue
+        if type_k is None:
+            atom_k.remove()
+            continue
+        atomtypes = ' '.join([atom_i.type,atom_j.type,atom_k.type])
+        molecule.angleClass(mol,atomnames)
+        angles.harmClass(root,atomtypes)
+        if (len(line)>4):
+            ang = angles.harmClass(root,atomtypes)
+            ang.k = float(line[5]) * 0.5
+            ang.theta0 = float(line[4])
+    return iangle
+
+#==================================================================================================
+# md2xml.read_dihedral_improper
+#==================================================================================================
+def read_dihedral_improper(root,mol,dihedral,id_atom,old_id):
+    """
+    Dihedrals and impropers are defined with the same keyword. The difference is the functional form
+    Therefore, both are read together. Again the same proceeding as for bonds and angles.
+    Currently supported potentials:
+    - multiple cosine
+    - Ryckaert-Bellmanns
+    - Fourier dihedral -> is converted to Ryckaert-Bellmanns
+    - Harmonic (only for impropers)
+
+    """
+    from ..md_xml import molecule
+    from ..md_xml import dihedrals
+    from ..md_xml import impropers
+                          
+    idihedral = 0
+    iimproper =0
+    dangerous_angles = []
+#    if "AUTOGENERATE" in dihedral[0]:
+#       Constructing all possible dihedrals     
+#        for atomnames in molecule.namelist_dihedral(mol):
+#            atoms = atomnames.split()
+#            atom_i = molecule.atomClass(mol,atoms[0])
+#            atom_j = molecule.atomClass(mol,atoms[1])
+#            atom_k = molecule.atomClass(mol,atoms[2])
+#            atom_l = molecule.atomClass(mol,atoms[3])
+#            angle_ijk = [atoms[0],atoms[1],atoms[2]]
+#            angle_jkl = [atoms[1],atoms[2],atoms[3]]
+#            idihedral += 1
+#            molecule.dihedralClass(mol,atomnames)
+#            atomtypes  = ' '.join([atom_i.type,
+#                                   atom_j.type,
+#                                   atom_k.type,
+#                                   atom_l.type])
+#            dihedrals.cosClass(root,atomtypes)
+#   Using given DIHEDRAL information from topology file  
+    for line in dihedral:
+        line = line.split()
+        del line[0]
+        dihedral0 = -1
+        for i in id_atom:
+            if str(int(line[0])+old_id) == id_atom[i]:
+                dihedral0 = i
+        for i in id_atom:
+            if str(int(line[1])+old_id) == id_atom[i]:
+                dihedral1 = i
+        for i in id_atom:
+            if str(int(line[2])+old_id) == id_atom[i]:
+                dihedral2 = i
+        for i in id_atom:
+            if str(int(line[3])+old_id) == id_atom[i]:
+                dihedral3 = i
+        if dihedral0 < 0:
+            print "Please check your input files- Error while reading angles!"
+            sys.exit(2)
+        atomnames = ' '.join([dihedral0,dihedral1, dihedral2, dihedral3])
+        atom_i = molecule.atomClass(mol,dihedral0)
+        atom_j = molecule.atomClass(mol,dihedral1)
+        atom_k = molecule.atomClass(mol,dihedral2)
+        atom_l = molecule.atomClass(mol,dihedral3)
+        type_i = atom_i.type
+        type_j = atom_j.type
+        type_k = atom_k.type
+        type_l = atom_l.type
+        if type_i is None:
+            atom_i.remove()
+            continue
+        if type_j is None:
+            atom_j.remove()
+            continue
+        if type_k is None:
+            atom_k.remove()
+            continue
+        if type_l is None:
+            atom_l.remove()
+            continue
+        atomtypes = ' '.join([atom_i.type,
+                              atom_j.type,
+                              atom_k.type,
+                              atom_l.type])
+        # Check what happend if dihedral already has parameters
+        if line[4] == '1':
+            dihedrals.cosClass(root,atomtypes)
+            molecule.dihedralClass(mol,atomnames)
+            idihedral += 1
+            if(len(line) > 5):
+                cos = dihedrals.cosClass(root,atomtypes)
+                old_n = cos.n
+ 		print old_n
+                old_k = cos.k
+                old_delta = cos.delta
+                current_k = float(line[6])
+                current_n = int(line[7])
+                current_delta = float(line[5])
+                if current_n in old_n:
+                    continue
+                else:
+                    cos.n = old_n + [current_n]
+                    cos.k = old_k + [current_k]
+                    cos.delta = old_delta + [current_delta]
+        elif line[4] == '3':
+            dihedrals.ryckClass(root,atomtypes)
+            molecule.dihedralClass(mol,atomnames)
+            idihedral += 1
+            if(len(line) > 5):
+                dih = dihedrals.ryckClass(root,atomtypes)
+                fc = []
+                fc.append(line[5])
+                fc.append(line[6])
+                fc.append(line[7])
+                fc.append(line[8])
+                fc.append(line[9])
+                fc.append(line[10])
+                dih.k = fc
+        elif line[4] == '5':
+            dihedrals.ryckClass(root,atomtypes)
+            molecule.dihedralClass(mol,atomnames)
+            if(len(line) >5):
+                fc = []
+                fc.append(float(line_element[6])+0.5*(float(line_element[5])+float(line_element[7])))
+                fc.append(0.5*(-1*float(line_element[5])+3*float(line_element[7])))
+                fc.append(-float(line_element[6]) + 4*float(line_element[8]))
+                fc.append(-2*(float(line_element[7])))
+                fc.append(-4*float(line_element[8]))
+                fc.append(0)
+                ryck.k = fc
+            idihedral += 1
+        elif line[4] == '4':
+            #impropers.cosClass(root,atomtypes)
+            imp_mol = molecule.improperClass(mol,atomnames)
+            imp_mol.central = atom_i.name
+            imp = impropers.cosClass(root,atomtypes)
+            imp.n = int(line[7])
+            imp.k = float(line[6])
+            imp.delta = float(line[5])
+            iimproper += 1
+        elif line[4] == '2':
+            #impropers.harmClass(root,atomtypes)
+            imp_mol = molecule.improperClass(mol,atomnames)
+            imp_mol.central = atom_i.name
+            imp = impropers.harmClass(root,atomtypes)
+            imp.k = float(line[6])*0.5
+            imp.theta0 = float(line[5])
+            iimproper += 1
+        else:
+            print "Please check the following line since this dihedral type is not supported at the moment."
+            print line
+            sys.exit(2)
+    return idihedral, iimproper
+
+#==================================================================================================
+# md2xml.find_atom_parameter
+#==================================================================================================
+def find_atom_parameter(root,parameterlist,fudgelj,fudgeqq):
+    """
+    Find nonbonded parameters
+    Subroutine:
+    - find_epsilon_sigma
+
+    """
+    from ..md_xml import molecule
+    from ..md_xml import nonbonded
+    import math
+
+    # Check for other mixing rules in GROMACS manual
+    current_nonbonded = nonbonded.nonbondedElement(root)
+    current_nonbonded.mixing_epsilon="geometric"
+    current_nonbonded.mixing_sigma="arithmetic"
+    
+    inb = 0
+    for imol in root.findall("molecule"):
+        for iatom in imol.findall("atom"):
+            atom_i = molecule.atomClass(imol,iatom.get('name'))
+            type_i = atom_i.type
+            (epsilon_i,sigma_i) = find_epsilon_sigma_gro(type_i,parameterlist)
+            nb_i = nonbonded.atomClass(root,type_i)
+            nb_i.epsilon = epsilon_i
+            nb_i.sigma = sigma_i
+            nb_i.vdw14 = fudgelj
+            nb_i.elec14 = fudgeqq
+            inb += 1
+
+    return inb
+
+#==================================================================================================
+# md2xml.find_epsilon_sigma_gro
+#==================================================================================================
+def find_epsilon_sigma_gro(atomtype,parameterlist):
+    """
+    find_epsilon_sigma
+    Looks for nonbonded interaction parameters in the current read force field
+
+    """
+    for line in parameterlist:
+        print line
+        line_element = line.split()
+        if line_element[0] == atomtype:
+            epsilon   =  float(line_element[6])
+            sigma     =  float(line_element[5])
+    return epsilon,sigma
+
+#==================================================================================================
+# md2xml.find_parameter_bonds
+#==================================================================================================
+def find_parameter_bonds(root,parameterlist):
+    """
+    This routine looks for parameters in a separate force field file if the parameters weren't
+    already read from the molecule itp file
+
+    """
+    from ..md_xml import bonds
+    import parameter
+    ibonds = 0
+#   Writing all bond potentials
+#   Check for morse potential
+    for i in root.findall('./bonds/*'):
+        bond_xml = i.get('type')
+        for line in parameterlist:
+            line_element = line.split()
+            atomtypes = bonds.sort(' '.join(line_element[0:2]))
+            (hit, x) = parameter.atom_match(atomtypes.split(),bond_xml.split())
+            if hit ==2:
+                harm = bonds.harmClass(root,bond_xml)
+                harm.k = float(line_element[4]) * 0.5
+                harm.r0 = float(line_element[3])
+                ibonds += 1
+    return ibonds
+
+#==================================================================================================
+# md2xml.find_parameter_angles
+#==================================================================================================
+def find_parameter_angles(root,parameterlist):
+    """
+    Similar to previous routine for bond parameters
+    """
+    from ..md_xml import angles
+    import parameter
+    iangles = 0
+#   Writing all angle potentials
+    for i in root.findall('./angles/*'):
+        angle_xml = i.get('type')
+        for line in parameterlist:
+            line_element = line.split()
+            atomtypes = angles.sort(' '.join(line_element[0:3]))
+            (hit, x) = parameter.atom_match(atomtypes.split(),angle_xml.split())
+            if hit==3:
+                harm = angles.harmClass(root,angle_xml)
+                harm.k = float(line_element[5]) * 0.5
+                harm.theta0 = float(line_element[4])
+                iangles += 1
+    return iangles
+
+#==================================================================================================
+# md2xml.find_parameter_dihedrals
+#==================================================================================================
+def find_parameter_dihedrals(root,parameterlist):
+    """
+    Similar to previous to for dihedrals
+
+    """
+    from ..md_xml import molecule
+    from ..md_xml import dihedrals
+    import parameter
+
+    idihedrals = 0
+#   writing all dihedrals
+    for i in root.findall('./dihedrals/*'):
+        dihedral_xml = i.get('type')
+        for line in parameterlist:
+            line_element = line.split()
+            atomtypes = dihedrals.sort(' '.join(line_element[0:4]))
+            (hit1, x1) = parameter.atom_match(atomtypes.split(),dihedral_xml.split())
+#           Wildcards may change the alphabetic order of the middle atoms
+            (hit2, x2) = parameter.atom_match((atomtypes.split())[::-1],dihedral_xml.split())
+            if hit1==4 or hit2==4 or hit1+x1==4 or hit2+x2==4:
+                if line_element[4] == "3":
+                    ryck = dihedrals.ryckClass(root,dihedral_xml)
+                    fc = []
+                    fc.append(line_element[5])
+                    fc.append(line_element[6])
+                    fc.append(line_element[7])
+                    fc.append(line_element[8])
+                    fc.append(line_element[9])
+                    fc.append(line_element[10])
+                    ryck.k = fc
+                elif line_element[4] == "1" or line_element[4] == "4":
+                    cos = dihedrals.cosClass(root,dihedral_xml)
+                    k = float(line_element[6])
+                    n = abs(float(line_element[7]))
+                    delta = float(line_element[6])
+                    cos.add(n,k,delta)
+                elif line_element[4] == "5":
+                    print " ! Warning: The dihedral ", dihedral_xml, " is a Fourier type one. It will be translated  to a RB dihedral with respect to the Gromacs manual."
+                    ryck = dihedrals.ryckClass(root,dihedral_xml)
+                    fc = []
+                    fc.append(float(line_element[6])+0.5*(float(line_element[5])+float(line_element[7])))
+                    fc.append(0.5*(-1*float(line_element[5])+3*float(line_element[7])))
+                    fc.append(-float(line_element[6]) + 4*float(line_element[8]))
+                    fc.append(-2*(float(line_element[7])))
+                    fc.append(-4*float(line_element[8]))
+                    fc.append(0)
+                    ryck.k = fc
+                else:
+                    print "Please check the following line since the dihedraltype is currently not supported."
+                    print line
+                    sys.exit(2)
+                idihedrals += 1
+    return idihedrals
